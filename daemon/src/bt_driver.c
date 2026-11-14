@@ -674,12 +674,30 @@ static int apply_kernel_allowlist_patch(int restore, uint32_t fw_version) {
 // If capacity cannot be patched on unmapped firmwares, the controller remains safely
 // in 10-byte 0x01 report mode where it operates cleanly without exceeding 22 bytes.
 
+// The link-capacity patch walks the bthid context pointer stored in a kernel global:
+//   FW 12.50 / 13.02 / 13.52 : base+0x2612550
+//   FW 9.00                  : base+0x2613db0 (found via the allowlist function at 0x5A5E13,
+//                              which does `ctx = *global; link = lookup(ctx, 1, addr)`; link
+//                              stride 0x1588, +0x30 address, +0x638 device, +0x1574 capacity
+//                              are identical to 12.50)
+// It is only verified on those firmwares. On any other firmware (9.00, 9.60, 10.xx, 11.00)
+// those offsets are wrong, so we must NOT run the patch or send 78-byte 0x31 output
+// reports: the controller stays in standard 10-byte Report 0x01 mode, which works.
+static bool bt_extended_mode_allowed(void) {
+    if (g_daemon_config.dualsense_bt_mode != 1) return false;
+    // 0x0900: verified from a FW 9.00 kernel dump (see bt_context_offset_for_fw()).
+    return s_current_fw_bcd == 0x0900 || s_current_fw_bcd == 0x1250 ||
+           s_current_fw_bcd == 0x1302 || s_current_fw_bcd == 0x1352;
+}
+
 struct CapacityRequest {
     uint64_t address;
     uint32_t restore;
     uint32_t original;
     uint32_t lock_off;
     uint32_t unlock_off;
+    uint32_t ctx_off;   // kernel global holding the bthid context pointer
+    uint32_t scan;      // 1: also scan nearby globals (legacy FWs); 0: verified offset only
 };
 
 struct CapacityArgs {
@@ -712,7 +730,7 @@ static int controller_capacity(void* thread, struct CapacityArgs* args) {
     uint8_t* found_link = NULL;
 
     // 1. Primary check: verified context offset 0x2612550 (FW 12.50, 13.02, 13.52)
-    uint8_t* context = *(void**)(base + 0x2612550);
+    uint8_t* context = r->ctx_off ? *(void**)(base + r->ctx_off) : NULL;
     if (context && ((uint64_t)context >> 48) == 0xFFFF) {
         for (uint32_t offset = 0x42A8; offset < 0x185A0; offset += 0x1588) {
             uint8_t* link = context + offset;
@@ -750,9 +768,9 @@ static int controller_capacity(void* thread, struct CapacityArgs* args) {
     }
 
     // 2. Secondary scan: nearby range [0x2612000 .. 0x2613000] if not found at 0x2612550
-    if (!found_link) {
+    if (!found_link && r->scan) {
         for (uint32_t cand = 0x2612000; cand <= 0x2613000; cand += 8) {
-            if (cand == 0x2612550) continue;
+            if (cand == r->ctx_off) continue;
             uint8_t* ctx = *(void**)(base + cand);
             if (!ctx || ((uint64_t)ctx >> 48) != 0xFFFF) continue;
 
@@ -803,12 +821,15 @@ static int controller_capacity(void* thread, struct CapacityArgs* args) {
 
 static int apply_controller_capacity(BtDevice* dev, int restore) {
     if (!dev || !dev->address) return -1;
+    if (!bt_extended_mode_allowed()) return -1; // unverified firmware: never touch kernel link state
     struct CapacityRequest req = {
         .address = dev->address,
         .restore = restore ? 1U : 0U,
         .original = restore ? dev->original_capacity : 0U,
         .lock_off = s_discovered_lock,
-        .unlock_off = s_discovered_unlock
+        .unlock_off = s_discovered_unlock,
+        .ctx_off = (s_current_fw_bcd == 0x0900) ? 0x2613db0U : 0x2612550U,
+        .scan = (s_current_fw_bcd == 0x0900) ? 0U : 1U
     };
     long rc = daemon_syscall(SYS_KEXEC, (long)controller_capacity, (long)&req, 0);
     if (rc == 0) {
@@ -1099,7 +1120,7 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
                        (unsigned long long)dev->address, dev->vpad_slot, slot_num);
             vpad_reactivate_slot(dev->vpad_slot);
             dev->last_calibration_attempt = daemon_sys_time_us();
-            if (g_daemon_config.dualsense_bt_mode == 1 && !dev->capacity_patched) {
+            if (bt_extended_mode_allowed() && !dev->capacity_patched) {
                 apply_controller_capacity(dev, 0);
             }
             if (dev->capacity_patched && !dev->initialized_output) {
@@ -1121,7 +1142,7 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
             daemon_log(LOG_LEVEL_INFO, "controller_connected: DualSense BT 0x%llX (Slot %d, Player %d)",
                        (unsigned long long)dev->address, dev->vpad_slot, slot_num);
 
-            if (g_daemon_config.dualsense_bt_mode == 1) {
+            if (bt_extended_mode_allowed()) {
                 int cap_rc = apply_controller_capacity(dev, 0);
                 if (cap_rc == 0) {
                     daemon_log(LOG_LEVEL_INFO, "DualSense BT (0x%llX): kernel link capacity patched to 78 bytes (orig=%u)",
@@ -1134,8 +1155,8 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
                 }
             } else {
                 dev->capacity_patched = false;
-                daemon_log(LOG_LEVEL_INFO, "DualSense BT (0x%llX): operating in safe 10-byte report mode (dualsense_bt_mode=0)",
-                           (unsigned long long)dev->address);
+                daemon_log(LOG_LEVEL_INFO, "DualSense BT (0x%llX): operating in safe 10-byte report mode (FW 0x%04X, dualsense_bt_mode=%d)",
+                           (unsigned long long)dev->address, s_current_fw_bcd, g_daemon_config.dualsense_bt_mode);
             }
         }
         usb_driver_load_remap_for_bt();
@@ -1344,7 +1365,7 @@ void bt_driver_poll_step(void) {
     // Paces keep-alive reports at 500ms to preserve Bluetooth Active Mode (Exit Sniff Mode) for crackle-free audio.
     for (int i = 0; i < BT_MAX_DEVICES; ++i) {
         BtDevice *dev = &s_devices[i];
-        if (g_daemon_config.dualsense_bt_mode == 1 && dev->connected && dev->address && dev->capacity_patched && !dev->output_unsupported) {
+        if (bt_extended_mode_allowed() && dev->connected && dev->address && dev->capacity_patched && !dev->output_unsupported) {
             uint64_t interval = dev->initialized_output ? 500000ULL : 20000ULL;
             if (now_us - dev->last_output_time >= interval) {
                 bt_send_rumble_dev(dev, 0, 0, dev->last_color);
@@ -1721,7 +1742,7 @@ int bt_driver_connected_count(void) {
 
 static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, const uint8_t color[3]) {
     if (!dev || !dev->connected || s_bt_fd < 0 || !dev->address) return;
-    if (g_daemon_config.dualsense_bt_mode == 0 || dev->output_unsupported || !dev->capacity_patched) return;
+    if (!bt_extended_mode_allowed() || dev->output_unsupported || !dev->capacity_patched) return;
 
     dev->last_output_time = daemon_sys_time_us();
     if (color && (color[0] || color[1] || color[2])) {
