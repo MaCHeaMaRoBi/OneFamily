@@ -682,6 +682,7 @@ struct CapacityRequest {
     uint32_t original;
     uint32_t lock_off;
     uint32_t unlock_off;
+    uint32_t ctx_off;   // kernel global holding the bthid context pointer (FW specific)
 };
 
 struct CapacityArgs {
@@ -712,10 +713,10 @@ static int controller_capacity(void* thread, struct CapacityArgs* args) {
 
     int rc = 2; // Link not found
 
-    // Verified context offset 0x2612550 (FW 12.50, 13.02, 13.52)
+    // Verified context globals: 0x2612550 (FW 12.50, 13.02, 13.52), 0x2613db0 (FW 9.00, from kernel dump)
     // Patch all matching link entries for r->address so a stale link entry from a prior
     // session never shadows a newly allocated link entry on reconnect (Issue #81).
-    uint8_t* context = *(void**)(base + 0x2612550);
+    uint8_t* context = r->ctx_off ? *(void**)(base + r->ctx_off) : NULL;
     if (context && ((uint64_t)context >> 48) == 0xFFFF) {
         for (uint32_t offset = 0x42A8; offset < 0x185A0; offset += 0x1588) {
             uint8_t* link = context + offset;
@@ -760,9 +761,12 @@ static int controller_capacity(void* thread, struct CapacityArgs* args) {
 static int apply_controller_capacity(BtDevice* dev, int restore) {
     if (!dev || !dev->address) return -1;
     // Strict Firmware Safe Gate (Issues #85, #86, #95 & AGENTS.md Section 2.1):
-    // Offset 0x2612550 is only valid on FW 12.50..13.52. On older firmwares (e.g. FW 9.00, 11.00, 12.00),
-    // never dereference 0x2612550 in Ring 0; return -1 so DualSense operates safely in 10-byte Report 0x01 mode.
-    if (s_current_fw_bcd != 0x1250 &&
+    // The bthid context global is only known on FW 9.00 (0x2613db0, derived from a FW 9.00 kernel dump:
+    // allowlist code at 0x5A5E13 does `ctx = *global; link = lookup(ctx, 1, addr)`, identical link layout)
+    // and FW 12.50..13.52 (0x2612550). On any other firmware (e.g. 9.60, 11.00, 12.00), never dereference
+    // unverified offsets in Ring 0; return -1 so DualSense operates safely in 10-byte Report 0x01 mode.
+    if (s_current_fw_bcd != 0x0900 &&
+        s_current_fw_bcd != 0x1250 &&
         s_current_fw_bcd != 0x1302 &&
         s_current_fw_bcd != 0x1304 &&
         s_current_fw_bcd != 0x1350 &&
@@ -774,7 +778,8 @@ static int apply_controller_capacity(BtDevice* dev, int restore) {
         .restore = restore ? 1U : 0U,
         .original = restore ? dev->original_capacity : 0U,
         .lock_off = s_discovered_lock,
-        .unlock_off = s_discovered_unlock
+        .unlock_off = s_discovered_unlock,
+        .ctx_off = (s_current_fw_bcd == 0x0900) ? 0x2613db0U : 0x2612550U
     };
     long rc = daemon_syscall(SYS_KEXEC, (long)controller_capacity, (long)&req, 0);
     if (rc == 0) {
