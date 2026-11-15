@@ -85,6 +85,9 @@ typedef struct {
     uint32_t original_capacity;
     uint32_t output_errors;
     bool     output_unsupported;
+    bool     output_relink_tried;
+    bool     patch_retry_disabled;   // firmware not supported for the capacity patch: stop retrying
+    uint64_t last_patch_attempt_us;
 } BtDevice;
 
 static BtDevice s_devices[BT_MAX_DEVICES];
@@ -125,6 +128,21 @@ static void bt_devices_reset(void) {
     for (int i = 0; i < BT_MAX_DEVICES; ++i) {
         bt_device_init_entry(&s_devices[i]);
     }
+}
+
+// The kernel destroys the bthid link when a controller powers off / disconnects, so every
+// link-bound setting (78-byte capacity patch, output state, IMU calibration) is stale after a
+// reconnect and must be redone. Relying on kernel connect events alone is not enough on FW 9.00.
+static void bt_dev_reset_link_state(BtDevice *dev) {
+    if (!dev) return;
+    dev->calibration_requested = false;
+    dev->extended_mode = false;
+    dev->initialized_output = false;
+    dev->capacity_patched = false;
+    dev->output_errors = 0;
+    dev->output_unsupported = false;
+    dev->output_relink_tried = false;
+    dev->last_calibration_attempt = daemon_sys_time_us();
 }
 
 static void bt_dev_release(BtDevice *dev) {
@@ -996,6 +1014,7 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
 
     uint8_t simple[10] = {0};
     const uint8_t* data = NULL;
+    bool link_was_reset = false;
 
     dev->last_drop_len = (uint8_t)(length > 255 ? 255 : length);
     dev->last_drop_id = report[0];
@@ -1014,6 +1033,9 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
         simple[8] = report[6];       // Bumpers, triggers, options, L3, R3
         simple[9] = report[7] & 3;   // PS and touchpad buttons
         data = simple;
+        // A controller that already switched to extended 0x31 reports never goes back to 0x01 on its own:
+        // seeing 0x01 again means it was powered off/on (new bthid link, capacity back to default).
+        if (dev->extended_mode) link_was_reset = true;
         dev->extended_mode = false;
     } else if (length == 78 && report[0] == 0x31) {
         // Extended 78-byte Bluetooth report with CRC32
@@ -1069,9 +1091,12 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
             daemon_log(LOG_LEVEL_INFO, "controller_reconnected: DualSense BT 0x%llX (Slot %d, Player %d)",
                        (unsigned long long)dev->address, dev->vpad_slot, slot_num);
             vpad_reactivate_slot(dev->vpad_slot);
-            dev->last_calibration_attempt = daemon_sys_time_us();
-            if (g_daemon_config.dualsense_bt_mode == 1 && !dev->capacity_patched) {
-                apply_controller_capacity(dev, 0);
+            bt_dev_reset_link_state(dev);
+            link_was_reset = false;
+            if (g_daemon_config.dualsense_bt_mode == 1) {
+                int cap_rc = apply_controller_capacity(dev, 0);
+                daemon_log(LOG_LEVEL_INFO, "DualSense BT (0x%llX): reconnect link capacity patch rc=%d",
+                           (unsigned long long)dev->address, cap_rc);
             }
         } else {
             // New device connection
@@ -1106,6 +1131,34 @@ static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, siz
         }
         usb_driver_load_remap_for_bt();
         bt_write_status_file();
+    }
+
+    // Self-heal: the 0x18/0x19 connect/disconnect events clear capacity_patched (the kernel link is
+    // recreated on every reconnect), but the daemon may never see the pad as "away" (< 30 s), so the
+    // reconnect branch above never runs. Whenever the pad is connected, extended mode is wanted and the
+    // patch is not in place, re-apply it (rate limited to once per second).
+    if (g_daemon_config.dualsense_bt_mode == 1 && dev->connected && !dev->capacity_patched &&
+        !dev->patch_retry_disabled && !dev->output_unsupported) {
+        uint64_t now_p = daemon_sys_time_us();
+        if (now_p - dev->last_patch_attempt_us >= 1000000ULL) {
+            dev->last_patch_attempt_us = now_p;
+            int cap_rc = apply_controller_capacity(dev, 0);
+            if (cap_rc == -1) {
+                dev->patch_retry_disabled = true; // unsupported firmware / no device
+            } else {
+                daemon_log(LOG_LEVEL_INFO, "DualSense BT (0x%llX): self-heal link capacity patch retry rc=%d (patched=%d)",
+                           (unsigned long long)dev->address, cap_rc, (int)dev->capacity_patched);
+            }
+        }
+    }
+
+    if (link_was_reset && dev->connected) {
+        bt_dev_reset_link_state(dev);
+        if (g_daemon_config.dualsense_bt_mode == 1) {
+            int cap_rc = apply_controller_capacity(dev, 0);
+            daemon_log(LOG_LEVEL_INFO, "DualSense BT (0x%llX): controller fell back to Report 0x01 (power cycle), re-applied link capacity patch rc=%d",
+                       (unsigned long long)dev->address, cap_rc);
+        }
     }
 
     dev->last_input_time = daemon_sys_time_us();
@@ -1505,6 +1558,7 @@ void bt_driver_poll_step(void) {
                         existing->capacity_patched = false;
                         existing->output_errors = 0;
                         existing->output_unsupported = false;
+                        existing->last_patch_attempt_us = 0; // retry the capacity patch on the next input packet
                     }
                 }
 
@@ -1951,8 +2005,17 @@ static void bt_send_rumble_dev(BtDevice* dev, uint8_t large, uint8_t small, cons
     if (rc == 0) {
         dev->initialized_output = true;
         dev->output_errors = 0;
+        dev->output_relink_tried = false;
     } else if ((uint32_t)rc != 0x802F3707U) {
-        if (++dev->output_errors >= 3) {
+        if (++dev->output_errors >= 3 && !dev->output_relink_tried) {
+            // Output rejected: the kernel link likely lost our capacity patch. Try once to re-patch.
+            dev->output_relink_tried = true;
+            dev->capacity_patched = false;
+            dev->output_errors = 0;
+            int cap_rc = apply_controller_capacity(dev, 0);
+            daemon_log(LOG_LEVEL_WARN, "DualSense BT (0x%llX): output error 0x%lX, re-applied link capacity patch rc=%d",
+                       (unsigned long long)dev->address, rc, cap_rc);
+        } else if (dev->output_errors >= 3) {
             dev->output_unsupported = true;
             daemon_log(LOG_LEVEL_WARN, "DualSense BT (0x%llX): disabling output reports after error 0x%lX",
                        (unsigned long long)dev->address, rc);
